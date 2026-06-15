@@ -1,769 +1,645 @@
 /**
- * Framework vs Implementation Compliance Checker
+ * Framework vs Implementation Compliance Checker — Project Upload Edition
  * Patch for code_review_enterprise release.html
  *
- * HOW TO USE:
- *   Add this line just before </body> in your HTML (after the adherence patch):
+ * Add before </body>:
  *   <script src="code-review-framework-compliance.js"></script>
  *
- * What this adds:
- *   • "⚖️ Framework" tab in the upload section
- *   • Paste framework/standard code on the left, implementation on the right
- *   • Click "Analyse Compliance" → get a scored report showing:
- *       - Overall compliance % with grade
- *       - Per-category scores (annotations, interfaces, methods, imports, naming, error handling)
- *       - ✅ What's implemented correctly
- *       - ❌ What's missing or wrong
- *       - 💡 Fix suggestions for each violation
+ * Both framework AND implementation support:
+ *   • Upload individual .java / .kt / .groovy files (multi-select)
+ *   • Upload full project as .zip / .jar / .war / .ear (auto-extracts all Java sources)
+ *   • Drag & drop onto either zone
+ *   • OR paste code directly into a textarea
+ *
+ * Analysis covers 8 compliance categories:
+ *   Annotations · Interface/Abstract Coverage · Import & Packages ·
+ *   Inheritance · Exception Handling · Logging · Naming Conventions ·
+ *   Structural Patterns
  */
 
 (function () {
     'use strict';
 
     /* =========================================================
-       1. EXTRACTION HELPERS
+       SECTION A — FILE STORE
+       Separate stores for framework files and impl files
        ========================================================= */
 
-    function extractInterfaces(code) {
-        const found = [];
-        const re = /\binterface\s+(\w+)/gm;
-        let m;
-        while ((m = re.exec(code))) found.push(m[1]);
-        return found;
+    const store = {
+        fw:   [],   // { filename, code }
+        impl: []    // { filename, code }
+    };
+
+    function addFiles(side, newFiles) {
+        newFiles.forEach(f => {
+            if (!store[side].find(x => x.filename === f.filename)) store[side].push(f);
+        });
+        renderFileList(side);
     }
 
-    function extractAbstractMethods(code) {
-        const found = [];
-        const re = /\babstract\s+(?:[\w<>\[\]]+\s+)+(\w+)\s*\(([^)]*)\)/gm;
-        let m;
-        while ((m = re.exec(code))) found.push({ name: m[1], params: m[2].trim() });
-        return found;
+    function removeFile(side, idx) {
+        store[side].splice(idx, 1);
+        renderFileList(side);
     }
 
-    function extractInterfaceMethods(code) {
-        const found = [];
-        // Inside interface bodies — lines that look like method signatures (no body)
-        const re = /(?:^|\n)\s*(?:(?:public|default|static)\s+)?(?!class|interface|enum)[\w<>\[\],\s]+\s+(\w+)\s*\(([^)]*)\)\s*(?:throws\s+[\w,\s]+)?\s*;/gm;
-        let m;
-        while ((m = re.exec(code))) found.push({ name: m[1], params: m[2].trim() });
-        return found;
+    function clearSide(side) {
+        store[side] = [];
+        renderFileList(side);
     }
 
-    function extractAnnotations(code) {
-        const found = new Set();
-        const re = /@(\w+)(?:\s*\(|[\s\n])/gm;
-        let m;
-        while ((m = re.exec(code))) found.add(m[1]);
-        return [...found];
+    function mergeCode(side) {
+        return store[side].map(f => `\n// === FILE: ${f.filename} ===\n${f.code}`).join('\n');
     }
 
-    function extractMethodSignatures(code) {
-        const found = [];
-        const re = /(?:public|protected|private)\s+(?:static\s+|final\s+|synchronized\s+)*(?:[\w<>\[\],\s]+)\s+(\w+)\s*\(([^)]*)\)/gm;
-        let m;
-        while ((m = re.exec(code))) {
-            if (!['class','interface','enum','if','for','while','switch'].includes(m[1])) {
-                found.push({ name: m[1], params: m[2].trim() });
-            }
+    /* ─── Extract Java sources from ZIP/JAR/WAR/EAR ─── */
+    async function extractArchive(file, side) {
+        setStatus(`Extracting ${file.name}…`);
+        const JSZip = window.JSZip;
+        if (!JSZip) { setStatus('JSZip not found — ensure jszip.min.js is included.'); return; }
+        try {
+            const zip = await JSZip.loadAsync(file);
+            const tasks = [];
+            zip.forEach((path, entry) => {
+                if (!entry.dir && /\.(java|kt|groovy)$/i.test(path)) {
+                    tasks.push(entry.async('string').then(code => ({ filename: path, code })));
+                }
+            });
+            const files = await Promise.all(tasks);
+            addFiles(side, files);
+            setStatus(`Extracted ${files.length} source file(s) from ${file.name}`);
+        } catch (e) {
+            setStatus('Archive extraction failed: ' + e.message);
         }
-        return found;
     }
 
-    function extractClassNames(code) {
-        const found = [];
-        const re = /\bclass\s+(\w+)/gm;
-        let m;
-        while ((m = re.exec(code))) found.push(m[1]);
-        return found;
+    /* ─── Read plain source files ─── */
+    function readSourceFiles(fileList, side) {
+        Array.from(fileList).forEach(f => {
+            const r = new FileReader();
+            r.onload = e => addFiles(side, [{ filename: f.name, code: e.target.result }]);
+            r.readAsText(f);
+        });
     }
 
-    function extractImports(code) {
-        const found = [];
-        const re = /^import\s+([\w.*]+)\s*;/gm;
-        let m;
-        while ((m = re.exec(code))) found.push(m[1]);
-        return found;
-    }
-
-    function extractPackages(imports) {
-        return imports.map(i => i.split('.').slice(0, -1).join('.'));
-    }
-
-    function extractExtendsImplements(code) {
-        const result = { extends: [], implements: [] };
-        const extRe = /\bextends\s+([\w,\s<>]+?)(?:\s+implements|\s*\{)/gm;
-        const impRe = /\bimplements\s+([\w,\s<>]+?)(?:\s*\{)/gm;
-        let m;
-        while ((m = extRe.exec(code))) {
-            result.extends.push(...m[1].split(',').map(s => s.trim().replace(/<.*>/, '')));
-        }
-        while ((m = impRe.exec(code))) {
-            result.implements.push(...m[1].split(',').map(s => s.trim().replace(/<.*>/, '')));
-        }
-        return result;
-    }
-
-    function extractExceptionHandling(code) {
-        return {
-            hasTryCatch:        /\btry\s*\{/.test(code),
-            catchCount:         (code.match(/\bcatch\s*\(/g) || []).length,
-            hasFinally:         /\bfinally\s*\{/.test(code),
-            throwsDeclarations: (code.match(/\bthrows\s+\w+/g) || []).length,
-            customExceptions:   (code.match(/class\s+\w+Exception\b/g) || []).length,
-            swallowsExceptions: /catch\s*\([^)]+\)\s*\{[\s\n]*\}/m.test(code) ||
-                                /catch\s*\([^)]+\)\s*\{\s*\/\//m.test(code),
-            logsExceptions:     /log\w*\.(error|warn|info)\s*\(/.test(code) ||
-                                /logger\.(error|warn)\s*\(/.test(code),
-            usesCustomEx:       /throw\s+new\s+\w+Exception/.test(code)
-        };
-    }
-
-    function extractLoggingStyle(code) {
-        return {
-            hasLogger:      /\bLogger\b|\blog\b\s*=|\bLOGGER\b/.test(code),
-            usesSlf4j:      /org\.slf4j|LoggerFactory\.getLogger/.test(code),
-            usesLog4j:      /org\.apache\.logging|LogManager\.getLogger/.test(code),
-            usesLombok:     /@Slf4j|@Log4j2|@CommonsLog/.test(code),
-            logLevels:      {
-                debug: /\.debug\s*\(/.test(code),
-                info:  /\.info\s*\(/.test(code),
-                warn:  /\.warn\s*\(/.test(code),
-                error: /\.error\s*\(/.test(code)
-            }
-        };
-    }
-
-    function extractNamingConventions(code) {
-        const classes  = (code.match(/\bclass\s+(\w+)/gm) || []).map(s => s.replace('class ', ''));
-        const methods  = (code.match(/(?:public|private|protected)\s+\w+\s+(\w+)\s*\(/gm) || []);
-        const fields   = (code.match(/private\s+(?:final\s+)?[\w<>]+\s+(\w+)\s*[=;]/gm) || []);
-        return {
-            classNames: classes,
-            hasPascalCaseClasses: classes.every(c => /^[A-Z]/.test(c)),
-            hasCamelCaseMethods: methods.every(m => /[a-z]\w+\s*\(/.test(m)),
-            hasConstantsUpperCase: /\bstatic\s+final\s+\w+\s+([A-Z_]+)\s*=/.test(code),
-            prefixPatterns: {
-                iPrefix:   classes.some(c => /^I[A-Z]/.test(c)),  // IUserService
-                implSuffix: classes.some(c => /Impl$/.test(c)),     // UserServiceImpl
-                dtoSuffix:  classes.some(c => /Dto$|DTO$/.test(c)),
-                repoSuffix: classes.some(c => /Repository$/.test(c))
-            }
-        };
+    /* ─── Render file list for a side ─── */
+    function renderFileList(side) {
+        const el = document.getElementById(`fc2-list-${side}`);
+        if (!el) return;
+        const files = store[side];
+        if (files.length === 0) { el.style.display = 'none'; return; }
+        el.style.display = '';
+        el.innerHTML = files.map((f, i) => `
+            <div style="display:flex;align-items:center;gap:0.5rem;padding:0.45rem 0.75rem;
+                        border-bottom:1px solid var(--border);font-size:0.78rem">
+                <span style="color:var(--accent-blue)">☕</span>
+                <span style="flex:1;font-family:'Fira Code',monospace;white-space:nowrap;
+                             overflow:hidden;text-overflow:ellipsis" title="${f.filename}">${f.filename}</span>
+                <span style="color:var(--text-muted);flex-shrink:0">${f.code.split('\n').length}L</span>
+                <button onclick="window._fc2Remove('${side}',${i})"
+                    style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:0.9rem;flex-shrink:0">✕</button>
+            </div>`).join('');
+        const countEl = document.getElementById(`fc2-count-${side}`);
+        if (countEl) countEl.textContent = `${files.length} file${files.length !== 1 ? 's' : ''}`;
     }
 
     /* =========================================================
-       2. COMPLIANCE ANALYSIS ENGINE
+       SECTION B — COMPLIANCE ANALYSIS ENGINE
+       (same 8-category logic, now operates on merged corpus)
        ========================================================= */
 
-    function analyzeCompliance(frameworkCode, implCode) {
-        const report = {
-            categories: [],
-            compliant:  [],
-            violations: [],
-            missing:    [],
-            overall:    0,
-            maxScore:   0
-        };
+    function extractAnnotations(code) {
+        const s = new Set();
+        const re = /@(\w+)(?:\s*\(|[\s\n])/gm;
+        let m;
+        while ((m = re.exec(code))) s.add(m[1]);
+        return [...s];
+    }
 
-        function addCategory(name, icon, checks) {
-            let catScore = 0, catMax = 0;
+    function extractInterfaces(code) {
+        const r = [], re = /\binterface\s+(\w+)/gm; let m;
+        while ((m = re.exec(code))) r.push(m[1]);
+        return r;
+    }
+
+    function extractAbstractMethods(code) {
+        const r = [], re = /\babstract\s+(?:[\w<>\[\]]+\s+)+(\w+)\s*\(([^)]*)\)/gm; let m;
+        while ((m = re.exec(code))) r.push({ name: m[1], params: m[2].trim() });
+        return r;
+    }
+
+    function extractInterfaceMethods(code) {
+        const r = [], re = /(?:^|\n)\s*(?:(?:public|default|static)\s+)?(?!class|interface|enum)[\w<>\[\],\s]+\s+(\w+)\s*\(([^)]*)\)\s*(?:throws[\w,\s]+)?\s*;/gm; let m;
+        while ((m = re.exec(code))) r.push({ name: m[1], params: m[2].trim() });
+        return r;
+    }
+
+    function extractMethodNames(code) {
+        const r = new Set(), re = /(?:public|protected|private)\s+(?:static\s+|final\s+)*(?:[\w<>\[\],\s]+)\s+(\w+)\s*\(/gm; let m;
+        while ((m = re.exec(code))) if (!['class','interface','enum','if','for','while','switch'].includes(m[1])) r.add(m[1]);
+        return r;
+    }
+
+    function extractImports(code) {
+        const r = [], re = /^import\s+([\w.*]+)\s*;/gm; let m;
+        while ((m = re.exec(code))) r.push(m[1]);
+        return r;
+    }
+
+    function extractExtendsImplements(code) {
+        const res = { extends: [], implements: [] };
+        let m;
+        const er = /\bextends\s+([\w,\s<>]+?)(?:\s+implements|\s*\{)/gm;
+        const ir = /\bimplements\s+([\w,\s<>]+?)(?:\s*\{)/gm;
+        while ((m = er.exec(code))) res.extends.push(...m[1].split(',').map(s => s.trim().replace(/<.*>/, '')));
+        while ((m = ir.exec(code))) res.implements.push(...m[1].split(',').map(s => s.trim().replace(/<.*>/, '')));
+        return res;
+    }
+
+    function extractEH(code) {
+        return {
+            hasTryCatch:     /\btry\s*\{/.test(code),
+            usesCustomEx:    /throw\s+new\s+\w+Exception/.test(code),
+            logsExceptions:  /log\w*\.(error|warn)\s*\(|logger\.(error|warn)\s*\(/.test(code),
+            swallows:        /catch\s*\([^)]+\)\s*\{\s*(?:\/\/[^\n]*)?\s*\}/m.test(code)
+        };
+    }
+
+    function extractLogging(code) {
+        return {
+            hasLogger:  /\bLogger\b|\blog\b\s*=|\bLOGGER\b/.test(code),
+            usesSlf4j:  /org\.slf4j|LoggerFactory\.getLogger/.test(code),
+            usesLombok: /@Slf4j|@Log4j2|@CommonsLog/.test(code)
+        };
+    }
+
+    function extractNaming(code) {
+        const classes = (code.match(/\bclass\s+(\w+)/gm) || []).map(s => s.replace('class ', ''));
+        return {
+            hasPascalCase:  classes.every(c => /^[A-Z]/.test(c)),
+            hasImplSuffix:  classes.some(c => /Impl$/.test(c)),
+            hasDtoSuffix:   classes.some(c => /Dto$|DTO$/.test(c)),
+            hasRepoSuffix:  classes.some(c => /Repository$/.test(c))
+        };
+    }
+
+    /* ─── Main compliance analysis ─── */
+    function analyzeCompliance(fwCode, implCode, fwLabel, implLabel) {
+        const report = { categories: [], compliant: [], violations: [], overall: 0, maxScore: 0 };
+
+        function category(name, icon, checks) {
+            let cScore = 0, cMax = 0;
             const items = [];
-            checks.forEach(({ label, passed, weight, compliant, violation, suggestion }) => {
-                catMax += weight;
-                if (passed) {
-                    catScore += weight;
-                    if (compliant) report.compliant.push(compliant);
-                } else {
-                    if (violation)  report.violations.push({ label, violation, suggestion });
-                    if (label)      report.missing.push(label);
-                }
+            checks.forEach(({ label, passed, weight, ok, bad, fix }) => {
+                cMax += weight;
+                if (passed) { cScore += weight; if (ok) report.compliant.push(ok); }
+                else { if (bad) report.violations.push({ label, bad, fix }); }
                 items.push({ label, passed, weight });
             });
-            report.overall  += catScore;
-            report.maxScore += catMax;
-            const pct = catMax > 0 ? Math.round(catScore / catMax * 100) : 100;
-            report.categories.push({ name, icon, score: catScore, maxScore: catMax, percentage: pct, items });
+            report.overall  += cScore;
+            report.maxScore += cMax;
+            const pct = cMax > 0 ? Math.round(cScore / cMax * 100) : 100;
+            report.categories.push({ name, icon, score: cScore, maxScore: cMax, pct, items });
         }
 
-        const fwAnnotations  = extractAnnotations(frameworkCode);
-        const implAnnotations = extractAnnotations(implCode);
-        const fwInterfaces   = extractInterfaces(frameworkCode);
-        const fwAbsMethods   = extractAbstractMethods(frameworkCode);
-        const fwIfMethods    = extractInterfaceMethods(frameworkCode);
-        const implMethods    = extractMethodSignatures(implCode);
-        const fwImports      = extractImports(frameworkCode);
-        const implImports    = extractImports(implCode);
-        const fwHierarchy    = extractExtendsImplements(frameworkCode);
-        const implHierarchy  = extractExtendsImplements(implCode);
-        const fwEH           = extractExceptionHandling(frameworkCode);
-        const implEH         = extractExceptionHandling(implCode);
-        const fwLog          = extractLoggingStyle(frameworkCode);
-        const implLog        = extractLoggingStyle(implCode);
-        const fwNaming       = extractNamingConventions(frameworkCode);
-        const implNaming     = extractNamingConventions(implCode);
-        const fwPackages     = extractPackages(fwImports);
-        const implMethodNames = implMethods.map(m => m.name);
+        const fwAnn   = extractAnnotations(fwCode);
+        const implAnn = extractAnnotations(implCode);
+        const fwIfaces = extractInterfaces(fwCode);
+        const fwAbsMethods = extractAbstractMethods(fwCode);
+        const fwIfMethods  = extractInterfaceMethods(fwCode);
+        const implMethodNames = extractMethodNames(implCode);
+        const fwImports   = extractImports(fwCode);
+        const implImports  = extractImports(implCode);
+        const fwHier  = extractExtendsImplements(fwCode);
+        const implHier = extractExtendsImplements(implCode);
+        const fwEH    = extractEH(fwCode);
+        const implEH   = extractEH(implCode);
+        const fwLog   = extractLogging(fwCode);
+        const implLog  = extractLogging(implCode);
+        const fwNam   = extractNaming(fwCode);
+        const implNam  = extractNaming(implCode);
 
-        /* ── Category 1: Annotation Compliance ── */
-        const criticalAnnotations = ['RestController','Controller','Service','Repository',
-            'Component','Transactional','Autowired','RequestMapping','GetMapping',
-            'PostMapping','PutMapping','DeleteMapping','Valid','NotNull','NotBlank',
-            'Override','Slf4j','Log4j2','Aspect','Entity','Table'];
-        const fwCritAnnotations = fwAnnotations.filter(a => criticalAnnotations.includes(a));
+        const critAnns = ['RestController','Controller','Service','Repository','Component',
+            'Transactional','Autowired','Valid','NotNull','NotBlank','Slf4j','Log4j2',
+            'Aspect','Entity','RequestMapping','GetMapping','PostMapping','PutMapping','DeleteMapping'];
+        const fwCrit = fwAnn.filter(a => critAnns.includes(a));
 
-        addCategory('Annotation Compliance', '🏷️',
-            fwCritAnnotations.length === 0
-                ? [{ label: 'Framework defines annotations', passed: false, weight: 0,
-                     violation: 'No annotations found in framework code to compare.',
-                     suggestion: 'Ensure framework code contains Spring/Jakarta annotations.' }]
-                : fwCritAnnotations.map(ann => ({
-                    label: `@${ann} used`,
-                    passed: implAnnotations.includes(ann),
+        /* 1 — Annotation compliance */
+        category('Annotation Compliance', '🏷️',
+            fwCrit.length === 0
+                ? [{ label: 'No critical annotations in framework', passed: true, weight: 1, ok: 'No annotation requirements' }]
+                : fwCrit.map(ann => ({
+                    label: `@${ann} present`,
+                    passed: implAnn.includes(ann),
                     weight: ['Service','Repository','RestController','Controller','Transactional','Valid'].includes(ann) ? 4 : 2,
-                    compliant: `@${ann} correctly applied in implementation`,
-                    violation:  `@${ann} defined in framework but missing in implementation`,
-                    suggestion: `Add @${ann} to the appropriate class or method in your implementation`
+                    ok:  `@${ann} correctly applied`,
+                    bad: `@${ann} in framework but missing in implementation`,
+                    fix: `Add @${ann} to the appropriate class or method`
                 }))
         );
 
-        /* ── Category 2: Interface & Abstract Class Compliance ── */
-        const allRequiredMethods = [...fwAbsMethods, ...fwIfMethods];
-        addCategory('Interface & Abstract Method Coverage', '🔌',
-            fwInterfaces.length === 0 && allRequiredMethods.length === 0
-                ? [{ label: 'Framework defines contracts', passed: false, weight: 0,
-                     violation: 'No interfaces or abstract methods in framework code.',
-                     suggestion: 'Define interfaces or abstract classes in the framework code.' }]
+        /* 2 — Interface / abstract method coverage */
+        const required = [...fwAbsMethods, ...fwIfMethods];
+        category('Interface & Abstract Coverage', '🔌',
+            fwIfaces.length === 0 && required.length === 0
+                ? [{ label: 'No interface contracts defined', passed: true, weight: 1, ok: 'No contracts to implement' }]
                 : [
-                    ...fwInterfaces.map(iface => ({
+                    ...fwIfaces.map(iface => ({
                         label: `Implements ${iface}`,
-                        passed: implHierarchy.implements.includes(iface) ||
-                                implCode.includes(`implements ${iface}`) ||
-                                implCode.includes(`extends ${iface}`),
+                        passed: implHier.implements.includes(iface) || implCode.includes(`implements ${iface}`) || implCode.includes(`extends ${iface}`),
                         weight: 4,
-                        compliant: `${iface} contract correctly implemented`,
-                        violation:  `Interface ${iface} defined in framework but not implemented`,
-                        suggestion: `public class YourClass implements ${iface} { /* implement all methods */ }`
+                        ok:  `${iface} interface correctly implemented`,
+                        bad: `Interface ${iface} defined in framework but not implemented`,
+                        fix: `public class YourClass implements ${iface} { /* implement all methods */ }`
                     })),
-                    ...allRequiredMethods.map(m => ({
-                        label: `Method ${m.name}() implemented`,
-                        passed: implMethodNames.includes(m.name),
+                    ...required.map(m => ({
+                        label: `Method ${m.name}() overridden`,
+                        passed: implMethodNames.has(m.name),
                         weight: 3,
-                        compliant: `${m.name}() correctly overridden`,
-                        violation:  `Required method ${m.name}() not implemented`,
-                        suggestion: `@Override\npublic <ReturnType> ${m.name}(${m.params}) { /* your implementation */ }`
+                        ok:  `${m.name}() correctly implemented`,
+                        bad: `Required method ${m.name}() not found in implementation`,
+                        fix: `@Override public <ReturnType> ${m.name}(${m.params}) { /* impl */ }`
                     }))
                 ]
         );
 
-        /* ── Category 3: Import & Package Compliance ── */
-        const fwUniquePackages = [...new Set(fwPackages)].filter(p => p.startsWith('org.spring') ||
-            p.startsWith('javax.') || p.startsWith('jakarta.') || p.startsWith('org.slf4j'));
-        addCategory('Import & Package Compliance', '📦',
-            fwUniquePackages.length === 0
-                ? [{ label: 'Framework defines packages', passed: true, weight: 1,
-                     compliant: 'No specific framework packages required' }]
-                : fwUniquePackages.map(pkg => {
-                    const used = implImports.some(i => i.startsWith(pkg));
-                    return {
-                        label: `Uses ${pkg}.*`,
-                        passed: used,
-                        weight: 2,
-                        compliant: `${pkg} packages properly imported`,
-                        violation:  `Framework uses ${pkg} but implementation doesn't import it`,
-                        suggestion: `import ${pkg}.*;  // or specific classes from this package`
-                    };
-                })
+        /* 3 — Import & package compliance */
+        const fwPkgs = [...new Set(fwImports.map(i => i.split('.').slice(0,-1).join('.')).filter(p =>
+            p.startsWith('org.spring') || p.startsWith('javax.') || p.startsWith('jakarta.') || p.startsWith('org.slf4j') || p.startsWith('io.github.resilience')))];
+        category('Import & Package Compliance', '📦',
+            fwPkgs.length === 0
+                ? [{ label: 'No framework packages required', passed: true, weight: 1, ok: 'No specific package imports required' }]
+                : fwPkgs.map(pkg => ({
+                    label: `Uses ${pkg}`,
+                    passed: implImports.some(i => i.startsWith(pkg)),
+                    weight: 2,
+                    ok:  `${pkg} correctly imported`,
+                    bad: `Framework uses ${pkg} but implementation doesn't import it`,
+                    fix: `import ${pkg}.*;  // or specific classes`
+                }))
         );
 
-        /* ── Category 4: Inheritance & Extension Compliance ── */
-        const parentChecks = [];
-        fwHierarchy.extends.filter(c => c && c !== 'Object').forEach(parent => {
-            parentChecks.push({
-                label: `Extends ${parent}`,
-                passed: implHierarchy.extends.includes(parent) || implCode.includes(`extends ${parent}`),
-                weight: 4,
-                compliant: `Correctly extends framework base class ${parent}`,
-                violation:  `Implementation should extend ${parent} (as framework requires) but doesn't`,
-                suggestion: `public class YourClass extends ${parent} { ... }`
-            });
-        });
-        if (parentChecks.length === 0) {
-            parentChecks.push({
-                label: 'No mandatory inheritance required',
-                passed: true, weight: 1,
-                compliant: 'Framework does not enforce specific inheritance'
-            });
-        }
-        addCategory('Inheritance & Extension Compliance', '🧬', parentChecks);
+        /* 4 — Inheritance compliance */
+        const parents = fwHier.extends.filter(c => c && c !== 'Object');
+        category('Inheritance & Extension', '🧬',
+            parents.length === 0
+                ? [{ label: 'No mandatory inheritance', passed: true, weight: 1, ok: 'No specific base class required' }]
+                : parents.map(p => ({
+                    label: `Extends ${p}`,
+                    passed: implHier.extends.includes(p) || implCode.includes(`extends ${p}`),
+                    weight: 4,
+                    ok:  `Correctly extends ${p}`,
+                    bad: `Framework requires extending ${p} but implementation does not`,
+                    fix: `public class YourClass extends ${p} { ... }`
+                }))
+        );
 
-        /* ── Category 5: Exception Handling Compliance ── */
+        /* 5 — Exception handling */
         const ehChecks = [];
-        if (fwEH.hasTryCatch) {
-            ehChecks.push({
-                label: 'Uses try-catch blocks',
-                passed: implEH.hasTryCatch, weight: 3,
-                compliant: 'Exception handling follows framework try-catch pattern',
-                violation:  'Framework uses try-catch but implementation has none',
-                suggestion: 'Wrap risky operations in try-catch matching framework pattern'
-            });
-        }
-        if (fwEH.usesCustomEx) {
-            ehChecks.push({
-                label: 'Throws custom exception types',
-                passed: implEH.usesCustomEx, weight: 3,
-                compliant: 'Custom exceptions used as per framework pattern',
-                violation:  'Framework throws custom exceptions but impl uses generic RuntimeException',
-                suggestion: 'throw new YourCustomException("message"); — avoid plain RuntimeException'
-            });
-        }
-        if (fwEH.logsExceptions) {
-            ehChecks.push({
-                label: 'Logs exceptions (no silent swallowing)',
-                passed: implEH.logsExceptions && !implEH.swallowsExceptions, weight: 3,
-                compliant: 'Exceptions are properly logged',
-                violation:  implEH.swallowsExceptions
-                    ? 'Exceptions silently swallowed (empty catch block or comment-only body)'
-                    : 'Framework logs exceptions but implementation does not',
-                suggestion: 'log.error("Failed: {}", e.getMessage(), e);  // always log with cause'
-            });
-        }
-        if (!fwEH.hasTryCatch && !fwEH.usesCustomEx) {
-            ehChecks.push({ label: 'Error handling style matches', passed: true, weight: 1,
-                compliant: 'No specific error handling pattern mandated by framework' });
-        }
-        addCategory('Exception Handling Compliance', '⚠️', ehChecks);
+        if (fwEH.hasTryCatch)   ehChecks.push({ label:'Uses try-catch',         passed:implEH.hasTryCatch,  weight:3, ok:'Exception handling matches',  bad:'Framework uses try-catch but implementation has none',                   fix:'Wrap risky calls in try-catch matching framework pattern' });
+        if (fwEH.usesCustomEx)  ehChecks.push({ label:'Custom exception types',  passed:implEH.usesCustomEx, weight:3, ok:'Custom exceptions used',       bad:'Framework throws custom exceptions but impl uses generic RuntimeException', fix:'throw new YourCustomException("msg", cause);' });
+        if (fwEH.logsExceptions) ehChecks.push({ label:'Exceptions logged (not swallowed)', passed:implEH.logsExceptions && !implEH.swallows, weight:3, ok:'Exceptions properly logged', bad: implEH.swallows ? 'Exceptions silently swallowed' : 'Framework logs exceptions but impl does not', fix:'log.error("Operation failed: {}", e.getMessage(), e);' });
+        if (ehChecks.length === 0) ehChecks.push({ label:'No exception handling required', passed:true, weight:1, ok:'No specific error handling pattern mandated' });
+        category('Exception Handling Compliance', '⚠️', ehChecks);
 
-        /* ── Category 6: Logging Compliance ── */
+        /* 6 — Logging */
         const logChecks = [];
         if (fwLog.hasLogger) {
-            logChecks.push({
-                label: 'Logger declared',
-                passed: implLog.hasLogger, weight: 2,
-                compliant: 'Logger correctly declared in implementation',
-                violation:  'Framework declares a logger but implementation does not',
-                suggestion: fwLog.usesLombok
-                    ? '@Slf4j  // add Lombok annotation to class'
-                    : 'private static final Logger log = LoggerFactory.getLogger(YourClass.class);'
-            });
-            if (fwLog.usesSlf4j) {
-                logChecks.push({
-                    label: 'Uses SLF4J (consistent logging framework)',
-                    passed: implLog.usesSlf4j || implLog.usesLombok, weight: 2,
-                    compliant: 'SLF4J logging framework consistent with framework standard',
-                    violation:  'Framework uses SLF4J but implementation uses a different logger',
-                    suggestion: 'import org.slf4j.Logger; import org.slf4j.LoggerFactory;'
-                });
-            }
-            if (fwLog.usesLombok) {
-                logChecks.push({
-                    label: 'Uses @Slf4j / @Log4j2 Lombok annotation',
-                    passed: implLog.usesLombok, weight: 2,
-                    compliant: '@Slf4j annotation used consistently',
-                    violation:  'Framework uses Lombok @Slf4j but implementation manually declares logger',
-                    suggestion: '@Slf4j\npublic class YourClass { ... }  // Lombok generates log field'
-                });
-            }
-            if (fwLog.logLevels.debug) {
-                logChecks.push({
-                    label: 'Uses debug-level logging',
-                    passed: implLog.logLevels.debug, weight: 1,
-                    compliant: 'Debug logging present for diagnostics',
-                    violation:  'Framework uses debug logging; implementation only has info/error',
-                    suggestion: 'log.debug("Processing: {}", input);  // add debug for key steps'
-                });
-            }
-        } else {
-            logChecks.push({ label: 'No logging standard mandated', passed: true, weight: 1,
-                compliant: 'Framework does not define a specific logging pattern' });
-        }
-        addCategory('Logging Compliance', '📋', logChecks);
+            logChecks.push({ label:'Logger declared', passed:implLog.hasLogger, weight:2, ok:'Logger declared correctly', bad:'Framework uses a logger but implementation does not', fix: fwLog.usesLombok ? '@Slf4j on the class' : 'private static final Logger log = LoggerFactory.getLogger(getClass());' });
+            if (fwLog.usesSlf4j)  logChecks.push({ label:'Uses SLF4J',     passed:implLog.usesSlf4j || implLog.usesLombok,  weight:2, ok:'SLF4J logging consistent', bad:'Framework uses SLF4J; impl uses different logger', fix:'import org.slf4j.Logger; import org.slf4j.LoggerFactory;' });
+            if (fwLog.usesLombok) logChecks.push({ label:'Uses @Slf4j/@Log4j2', passed:implLog.usesLombok, weight:2, ok:'Lombok logging annotation used', bad:'Framework uses Lombok @Slf4j; impl manually declares logger', fix:'@Slf4j\npublic class YourClass { ... }' });
+        } else logChecks.push({ label:'No logging standard defined', passed:true, weight:1, ok:'No logging standard mandated' });
+        category('Logging Compliance', '📋', logChecks);
 
-        /* ── Category 7: Naming Convention Compliance ── */
-        const namingChecks = [];
-        if (fwNaming.prefixPatterns.implSuffix) {
-            namingChecks.push({
-                label: 'Implementation classes use "Impl" suffix',
-                passed: implNaming.prefixPatterns.implSuffix, weight: 2,
-                compliant: 'Impl naming convention followed',
-                violation:  'Framework uses *Impl suffix naming but implementation does not',
-                suggestion: 'Rename: class UserServiceImpl implements UserService { ... }'
-            });
-        }
-        if (fwNaming.prefixPatterns.dtoSuffix) {
-            namingChecks.push({
-                label: 'DTOs use "Dto" or "DTO" suffix',
-                passed: implNaming.prefixPatterns.dtoSuffix, weight: 2,
-                compliant: 'DTO naming convention followed',
-                violation:  'Framework uses *Dto naming but implementation does not',
-                suggestion: 'Rename: class UserDto { ... } or class UserDTO { ... }'
-            });
-        }
-        if (fwNaming.prefixPatterns.repoSuffix) {
-            namingChecks.push({
-                label: 'Repositories use "Repository" suffix',
-                passed: implNaming.prefixPatterns.repoSuffix, weight: 2,
-                compliant: 'Repository naming convention followed',
-                violation:  'Framework uses *Repository naming but implementation does not',
-                suggestion: 'Rename: interface UserRepository extends JpaRepository<User, Long>'
-            });
-        }
-        namingChecks.push({
-            label: 'Classes use PascalCase',
-            passed: implNaming.hasPascalCaseClasses, weight: 2,
-            compliant: 'PascalCase class naming correct',
-            violation:  'Class names do not follow PascalCase convention',
-            suggestion: 'Rename classes to start with uppercase: class UserService (not userService)'
-        });
-        if (namingChecks.length === 1) {
-            namingChecks.push({ label: 'Framework naming pattern matched', passed: true, weight: 1,
-                compliant: 'No specific naming pattern enforced by framework' });
-        }
-        addCategory('Naming Convention Compliance', '🏷️', namingChecks);
+        /* 7 — Naming conventions */
+        const namChecks = [];
+        if (fwNam.hasImplSuffix) namChecks.push({ label:'"Impl" suffix on implementations', passed:implNam.hasImplSuffix, weight:2, ok:'Impl suffix convention followed', bad:'Framework uses Impl suffix but implementation does not', fix:'class UserServiceImpl implements UserService { ... }' });
+        if (fwNam.hasDtoSuffix)  namChecks.push({ label:'"Dto"/"DTO" suffix on data classes', passed:implNam.hasDtoSuffix, weight:2, ok:'DTO suffix convention followed', bad:'Framework uses Dto suffix but implementation does not', fix:'class UserDto { ... }' });
+        if (fwNam.hasRepoSuffix) namChecks.push({ label:'"Repository" suffix', passed:implNam.hasRepoSuffix, weight:2, ok:'Repository suffix convention followed', bad:'Framework uses Repository suffix but implementation does not', fix:'interface UserRepository extends JpaRepository<User,Long> {}' });
+        namChecks.push({ label:'PascalCase class names', passed:implNam.hasPascalCase, weight:2, ok:'PascalCase naming correct', bad:'Class names do not follow PascalCase', fix:'Rename: class UserService (not userService)' });
+        category('Naming Convention Compliance', '🏷️', namChecks);
 
-        /* ── Category 8: Structural Pattern Compliance ── */
-        const structChecks = [];
-        const fwUsesConstructorInj = /private\s+final\s+\w+\s+\w+/m.test(frameworkCode) ||
-                                     /@RequiredArgsConstructor/.test(frameworkCode);
-        const implUsesConstructorInj = /private\s+final\s+\w+\s+\w+/m.test(implCode) ||
-                                      /@RequiredArgsConstructor/.test(implCode);
-        const fwUsesFieldInj = /@Autowired\b/.test(frameworkCode);
-        const implUsesFieldInj = /@Autowired\b/.test(implCode);
+        /* 8 — Structural patterns */
+        const strChecks = [];
+        const fwCtorInj  = /private\s+final\s+\w+\s+\w+/m.test(fwCode) || /@RequiredArgsConstructor/.test(fwCode);
+        const fwFieldInj = /@Autowired\b/.test(fwCode);
+        if (fwCtorInj)  strChecks.push({ label:'Constructor injection (final fields)', passed:/private\s+final\s+\w+\s+\w+/m.test(implCode) || /@RequiredArgsConstructor/.test(implCode), weight:4, ok:'Constructor injection follows framework',  bad:'Framework uses constructor injection; impl uses @Autowired fields', fix:'@RequiredArgsConstructor or explicit constructor with final fields' });
+        if (fwFieldInj && !fwCtorInj) strChecks.push({ label:'Field injection consistent', passed:/@Autowired\b/.test(implCode), weight:2, ok:'Field injection style consistent', bad:'Framework uses @Autowired; impl does not inject dependencies', fix:'@Autowired private UserService service;' });
+        if (/ResponseEntity/.test(fwCode)) strChecks.push({ label:'Returns ResponseEntity', passed:/ResponseEntity/.test(implCode), weight:3, ok:'ResponseEntity pattern consistent', bad:'Framework returns ResponseEntity; impl returns raw objects', fix:'return ResponseEntity.ok(dto);' });
+        if (/Optional</.test(fwCode)) strChecks.push({ label:'Uses Optional<> for nullable returns', passed:/Optional</.test(implCode), weight:2, ok:'Optional<> pattern consistent', bad:'Framework uses Optional<>; impl can return null', fix:'public Optional<User> findById(Long id) { return repo.findById(id); }' });
+        if (strChecks.length === 0) strChecks.push({ label:'No structural pattern requirements', passed:true, weight:1, ok:'No specific structural patterns mandated' });
+        category('Structural Pattern Compliance', '🏗️', strChecks);
 
-        if (fwUsesConstructorInj) {
-            structChecks.push({
-                label: 'Constructor injection used (not field injection)',
-                passed: implUsesConstructorInj, weight: 4,
-                compliant: 'Constructor injection follows framework pattern',
-                violation:  'Framework uses constructor injection but implementation uses @Autowired field injection',
-                suggestion: 'private final UserService service; // with constructor or @RequiredArgsConstructor'
-            });
-        }
-        if (fwUsesFieldInj && !fwUsesConstructorInj) {
-            structChecks.push({
-                label: 'Field injection style consistent',
-                passed: implUsesFieldInj, weight: 2,
-                compliant: 'Field injection style consistent with framework',
-                violation:  'Framework uses @Autowired field injection; implementation does not inject dependencies',
-                suggestion: '@Autowired\nprivate UserService service;'
-            });
-        }
-
-        const fwUsesResponseEntity = /ResponseEntity/.test(frameworkCode);
-        if (fwUsesResponseEntity) {
-            structChecks.push({
-                label: 'Returns ResponseEntity (not raw objects)',
-                passed: /ResponseEntity/.test(implCode), weight: 3,
-                compliant: 'ResponseEntity return type consistent with framework',
-                violation:  'Framework returns ResponseEntity but implementation returns raw objects',
-                suggestion: 'public ResponseEntity<UserDto> getUser(Long id) { return ResponseEntity.ok(dto); }'
-            });
-        }
-
-        const fwUsesOptional = /Optional</.test(frameworkCode);
-        if (fwUsesOptional) {
-            structChecks.push({
-                label: 'Uses Optional<> for nullable returns',
-                passed: /Optional</.test(implCode), weight: 2,
-                compliant: 'Optional<> pattern consistent with framework',
-                violation:  'Framework uses Optional<> but implementation can return null',
-                suggestion: 'public Optional<User> findById(Long id) { return repo.findById(id); }'
-            });
-        }
-
-        if (structChecks.length === 0) {
-            structChecks.push({ label: 'Structural patterns match', passed: true, weight: 1,
-                compliant: 'No specific structural patterns mandated' });
-        }
-        addCategory('Structural Pattern Compliance', '🏗️', structChecks);
-
-        /* ── Final score ── */
-        const pct = report.maxScore > 0
-            ? Math.round(report.overall / report.maxScore * 100) : 0;
+        const pct = report.maxScore > 0 ? Math.round(report.overall / report.maxScore * 100) : 0;
         report.percentage = pct;
-        report.grade = pct >= 85 ? 'A' : pct >= 70 ? 'B' : pct >= 55 ? 'C' : pct >= 40 ? 'D' : 'F';
+        report.grade      = pct >= 85 ? 'A' : pct >= 70 ? 'B' : pct >= 55 ? 'C' : pct >= 40 ? 'D' : 'F';
         report.gradeColor = pct >= 85 ? '#3fb950' : pct >= 70 ? '#d29922' : pct >= 55 ? '#f0883e' : '#f85149';
-
+        report.fwFiles    = store.fw.length;
+        report.implFiles  = store.impl.length;
+        report.fwLabel    = fwLabel;
+        report.implLabel  = implLabel;
         return report;
     }
 
     /* =========================================================
-       3. RENDER COMPLIANCE REPORT
+       SECTION C — RENDER REPORT
        ========================================================= */
 
-    function renderComplianceReport(report, fwName, implName) {
-        const container = document.getElementById('fc-results');
-        if (!container) return;
+    function renderReport(report) {
+        const el = document.getElementById('fc2-results');
+        if (!el) return;
 
-        const gradeColor = report.gradeColor;
+        const { percentage: pct, grade, gradeColor: gc } = report;
 
-        container.innerHTML = `
-            <!-- Hero row -->
+        const categoryRows = report.categories.map(cat => {
+            const col = cat.pct >= 80 ? '#3fb950' : cat.pct >= 65 ? '#d29922' : cat.pct >= 45 ? '#f0883e' : '#f85149';
+            const chips = cat.items.map(it => `
+                <span style="display:inline-flex;align-items:center;gap:0.25rem;padding:0.18rem 0.5rem;
+                    border-radius:10px;font-size:0.68rem;margin:0.15rem;
+                    background:${it.passed ? 'rgba(63,185,80,0.15)' : 'rgba(248,81,73,0.15)'};
+                    color:${it.passed ? '#3fb950' : '#f85149'};
+                    border:1px solid ${it.passed ? '#3fb95044' : '#f8514944'}">
+                    ${it.passed ? '✓' : '✗'} ${it.label}</span>`).join('');
+            return `
+                <div style="background:var(--bg-tertiary);border:1px solid var(--border);border-radius:8px;padding:1rem;margin-bottom:0.75rem">
+                    <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.55rem">
+                        <span style="font-size:1.1rem">${cat.icon}</span>
+                        <span style="font-weight:600;font-size:0.88rem;flex:1">${cat.name}</span>
+                        <span style="font-size:0.7rem;color:var(--text-muted)">${cat.score}/${cat.maxScore}pt</span>
+                        <span style="font-weight:800;color:${col};min-width:40px;text-align:right">${cat.pct}%</span>
+                    </div>
+                    <div style="height:5px;background:var(--bg-primary);border-radius:3px;overflow:hidden;margin-bottom:0.65rem">
+                        <div style="height:100%;width:${cat.pct}%;background:${col};border-radius:3px;transition:width 0.5s ease"></div>
+                    </div>
+                    <div>${chips}</div>
+                </div>`;
+        }).join('');
+
+        const violHTML = report.violations.map(v => `
+            <div style="background:#1a0808;border:1px solid rgba(248,81,73,0.3);border-radius:8px;padding:0.875rem;margin-bottom:0.6rem">
+                <div style="font-size:0.78rem;font-weight:600;color:#f85149;margin-bottom:0.3rem">${v.label}</div>
+                <div style="font-size:0.79rem;color:var(--text-secondary);margin-bottom:0.4rem">${v.bad}</div>
+                <div style="font-size:0.73rem;color:#3fb950;font-family:'Fira Code',monospace;
+                            border-left:2px solid #3fb950;padding-left:0.5rem;white-space:pre-wrap">💡 ${v.fix}</div>
+            </div>`).join('');
+
+        const okHTML = report.compliant.map(c => `
+            <div style="display:flex;align-items:center;gap:0.5rem;padding:0.3rem 0;
+                        border-bottom:1px solid rgba(48,54,61,0.4);font-size:0.78rem;color:var(--text-secondary)">
+                <span style="color:#3fb950;flex-shrink:0">✓</span>${c}
+            </div>`).join('');
+
+        el.innerHTML = `
+            <!-- Hero -->
             <div style="display:grid;grid-template-columns:auto 1fr;gap:1.5rem;align-items:center;
-                        margin-bottom:2rem;background:var(--bg-tertiary);border:1px solid var(--border);
-                        border-radius:12px;padding:1.5rem">
+                        background:var(--bg-tertiary);border:1px solid var(--border);border-radius:12px;padding:1.5rem;margin-bottom:1.5rem">
                 <div style="text-align:center">
-                    <div style="font-size:3.5rem;font-weight:900;color:${gradeColor};line-height:1">${report.grade}</div>
-                    <div style="font-size:1.1rem;font-weight:700;color:${gradeColor}">${report.percentage}%</div>
-                    <div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.25rem">COMPLIANCE</div>
+                    <div style="font-size:3.5rem;font-weight:900;color:${gc};line-height:1">${grade}</div>
+                    <div style="font-size:1.1rem;font-weight:700;color:${gc}">${pct}%</div>
+                    <div style="font-size:0.68rem;color:var(--text-muted)">COMPLIANCE</div>
                 </div>
                 <div>
                     <div style="height:10px;background:var(--bg-primary);border-radius:5px;overflow:hidden;margin-bottom:1rem">
-                        <div style="height:100%;width:${report.percentage}%;background:${gradeColor};
-                                    border-radius:5px;transition:width 0.6s ease"></div>
+                        <div style="height:100%;width:${pct}%;background:${gc};border-radius:5px;transition:width 0.6s ease"></div>
                     </div>
-                    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0.75rem">
-                        <div style="text-align:center">
-                            <div style="font-size:1.4rem;font-weight:700;color:#3fb950">${report.compliant.length}</div>
-                            <div style="font-size:0.68rem;color:var(--text-muted);text-transform:uppercase">Compliant</div>
-                        </div>
-                        <div style="text-align:center">
-                            <div style="font-size:1.4rem;font-weight:700;color:#f85149">${report.violations.length}</div>
-                            <div style="font-size:0.68rem;color:var(--text-muted);text-transform:uppercase">Violations</div>
-                        </div>
-                        <div style="text-align:center">
-                            <div style="font-size:1.4rem;font-weight:700;color:#d29922">${report.missing.length}</div>
-                            <div style="font-size:0.68rem;color:var(--text-muted);text-transform:uppercase">Missing</div>
-                        </div>
+                    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0.6rem;margin-bottom:0.75rem">
+                        ${[
+                            [`${report.fwFiles}`, 'FW Files', '#bc8cff'],
+                            [`${report.implFiles}`, 'Impl Files', '#58a6ff'],
+                            [`${report.compliant.length}`, 'Compliant', '#3fb950'],
+                            [`${report.violations.length}`, 'Violations', report.violations.length > 0 ? '#f85149' : '#3fb950'],
+                        ].map(([v,l,c]) => `
+                            <div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;padding:0.6rem;text-align:center">
+                                <div style="font-size:1.4rem;font-weight:700;color:${c}">${v}</div>
+                                <div style="font-size:0.65rem;color:var(--text-muted);text-transform:uppercase">${l}</div>
+                            </div>`).join('')}
                     </div>
-                    <div style="margin-top:0.75rem;font-size:0.78rem;color:var(--text-muted)">
-                        <span style="color:var(--accent-blue)">${implName}</span>
-                        vs framework
-                        <span style="color:var(--accent-purple)">${fwName}</span>
+                    <div style="font-size:0.77rem;color:var(--text-muted)">
+                        <span style="color:var(--accent-purple)">📐 ${report.fwLabel}</span>
+                        <span style="margin:0 0.4rem">vs</span>
+                        <span style="color:var(--accent-blue)">🔧 ${report.implLabel}</span>
                     </div>
                 </div>
             </div>
 
-            <!-- Category breakdown -->
-            <div style="font-size:1rem;font-weight:600;margin-bottom:1rem;color:var(--text-primary)">📊 Category Breakdown</div>
-            ${report.categories.map(cat => renderCategoryCard(cat)).join('')}
+            <!-- Categories -->
+            <div style="font-size:1rem;font-weight:600;margin-bottom:0.75rem">📊 Compliance Categories</div>
+            ${categoryRows}
 
             <!-- Violations -->
             ${report.violations.length ? `
-            <div style="font-size:1rem;font-weight:600;margin:1.5rem 0 1rem;color:#f85149">❌ Violations (${report.violations.length})</div>
-            ${report.violations.map(v => `
-                <div style="background:#1a0808;border:1px solid rgba(248,81,73,0.3);border-radius:8px;
-                            padding:1rem;margin-bottom:0.75rem">
-                    <div style="font-size:0.78rem;font-weight:600;color:#f85149;margin-bottom:0.4rem">${v.label}</div>
-                    <div style="font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.5rem">${v.violation}</div>
-                    ${v.suggestion ? `<div style="font-size:0.75rem;color:#3fb950;font-family:'Fira Code',monospace;
-                        background:var(--bg-primary);padding:0.5rem 0.75rem;border-radius:4px;
-                        border-left:2px solid #3fb950;white-space:pre-wrap">💡 ${v.suggestion}</div>` : ''}
-                </div>`).join('')}` : ''}
+                <div style="font-size:1rem;font-weight:600;color:#f85149;margin:1.25rem 0 0.75rem">
+                    ❌ Violations (${report.violations.length})</div>
+                ${violHTML}` : `<div style="color:#3fb950;font-weight:600;margin:1rem 0">✅ No violations — all checks passing!</div>`}
 
-            <!-- Compliant items -->
+            <!-- Compliant -->
             ${report.compliant.length ? `
-            <div style="font-size:1rem;font-weight:600;margin:1.5rem 0 1rem;color:#3fb950">✅ Compliant Items (${report.compliant.length})</div>
-            <div style="background:var(--bg-tertiary);border:1px solid var(--border);border-radius:8px;padding:1rem">
-                ${report.compliant.map(c => `
-                    <div style="display:flex;align-items:center;gap:0.6rem;padding:0.3rem 0;
-                                font-size:0.8rem;color:var(--text-secondary);
-                                border-bottom:1px solid rgba(48,54,61,0.4)">
-                        <span style="color:#3fb950;flex-shrink:0">✓</span>${c}
-                    </div>`).join('')}
-            </div>` : ''}
-        `;
-    }
+                <div style="font-size:1rem;font-weight:600;color:#3fb950;margin:1.25rem 0 0.75rem">
+                    ✅ Compliant (${report.compliant.length})</div>
+                <div style="background:var(--bg-tertiary);border:1px solid var(--border);border-radius:8px;padding:0.875rem 1rem">
+                    ${okHTML}</div>` : ''}
 
-    function renderCategoryCard(cat) {
-        const color = cat.percentage >= 80 ? '#3fb950'
-                    : cat.percentage >= 60 ? '#d29922'
-                    : cat.percentage >= 40 ? '#f0883e' : '#f85149';
-        return `
-            <div style="background:var(--bg-tertiary);border:1px solid var(--border);border-radius:8px;
-                        padding:1rem;margin-bottom:0.75rem">
-                <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.6rem">
-                    <span style="font-size:1.1rem">${cat.icon}</span>
-                    <span style="font-weight:600;font-size:0.9rem;flex:1">${cat.name}</span>
-                    <span style="font-weight:800;color:${color};font-size:1rem">${cat.percentage}%</span>
-                    <span style="font-size:0.7rem;color:var(--text-muted)">${cat.score}/${cat.maxScore}pt</span>
-                </div>
-                <div style="height:5px;background:var(--bg-primary);border-radius:3px;overflow:hidden;margin-bottom:0.75rem">
-                    <div style="height:100%;width:${cat.percentage}%;background:${color};border-radius:3px;transition:width 0.5s ease"></div>
-                </div>
-                <div style="display:flex;flex-wrap:wrap;gap:0.35rem">
-                    ${cat.items.map(item => `
-                        <span style="display:inline-flex;align-items:center;gap:0.3rem;padding:0.2rem 0.55rem;
-                                     border-radius:10px;font-size:0.69rem;
-                                     background:${item.passed ? 'rgba(63,185,80,0.15)' : 'rgba(248,81,73,0.15)'};
-                                     color:${item.passed ? '#3fb950' : '#f85149'};
-                                     border:1px solid ${item.passed ? '#3fb95044' : '#f8514944'}">
-                            ${item.passed ? '✓' : '✗'} ${item.label}
-                        </span>`).join('')}
-                </div>
+            <!-- Export -->
+            <div style="margin-top:1.25rem;text-align:right">
+                <button class="btn btn-sm" onclick="window._fc2Export()">📄 Export Report</button>
             </div>`;
     }
 
     /* =========================================================
-       4. INJECT "Framework" UPLOAD TAB UI
+       SECTION D — INJECT UI
        ========================================================= */
 
-    function injectFrameworkTab() {
-        /* ── Tab button ── */
+    function buildUploadZone(side, label, color, icon) {
+        const sideId = side;
+        return `
+        <div>
+            <!-- Header -->
+            <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.6rem">
+                <span style="font-size:1rem">${icon}</span>
+                <span style="font-size:0.85rem;font-weight:700;color:${color}">${label}</span>
+                <span id="fc2-count-${sideId}" style="font-size:0.72rem;color:var(--text-muted);margin-left:auto"></span>
+            </div>
+
+            <!-- Upload buttons -->
+            <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:0.6rem">
+                <label class="btn btn-sm" style="cursor:pointer;font-size:0.78rem">
+                    ☕ .java / .kt files
+                    <input type="file" accept=".java,.kt,.groovy" multiple style="display:none"
+                        onchange="window._fc2Files('${sideId}',this.files);this.value=''">
+                </label>
+                <label class="btn btn-sm" style="cursor:pointer;font-size:0.78rem">
+                    📦 ZIP / JAR / WAR
+                    <input type="file" accept=".zip,.jar,.war,.ear" style="display:none"
+                        onchange="window._fc2Archive('${sideId}',this.files[0]);this.value=''">
+                </label>
+                <button class="btn btn-sm" onclick="window._fc2Clear('${sideId}')"
+                    style="font-size:0.78rem">🗑 Clear</button>
+            </div>
+
+            <!-- Drop zone -->
+            <div id="fc2-drop-${sideId}" style="border:2px dashed var(--border);border-radius:8px;
+                    padding:1.5rem;text-align:center;cursor:pointer;transition:all 0.25s;min-height:100px"
+                ondragover="event.preventDefault();this.style.borderColor='${color}';this.style.background='${color}11'"
+                ondragleave="this.style.borderColor='';this.style.background=''"
+                ondrop="event.preventDefault();this.style.borderColor='';this.style.background='';window._fc2Drop('${sideId}',event)">
+                <div style="font-size:2rem;opacity:0.35;margin-bottom:0.4rem">📂</div>
+                <div style="font-size:0.78rem;color:var(--text-muted)">Drop files or archive here<br>
+                    <span style="font-size:0.68rem">.java · .kt · .zip · .jar · .war · .ear</span></div>
+            </div>
+
+            <!-- Paste toggle -->
+            <details style="margin-top:0.5rem">
+                <summary style="cursor:pointer;font-size:0.78rem;color:var(--text-muted);padding:0.3rem 0">
+                    or paste code directly ▸</summary>
+                <div style="margin-top:0.4rem">
+                    <input id="fc2-paste-name-${sideId}" class="paste-input"
+                        placeholder="filename.java" style="width:100%;margin-bottom:0.4rem;font-size:0.8rem">
+                    <textarea id="fc2-paste-${sideId}" class="code-textarea" rows="8"
+                        placeholder="Paste ${label.toLowerCase()} code here…"></textarea>
+                    <button class="btn btn-sm" style="margin-top:0.4rem;font-size:0.78rem"
+                        onclick="window._fc2AddPaste('${sideId}')">+ Add to ${label}</button>
+                </div>
+            </details>
+
+            <!-- File list -->
+            <div id="fc2-list-${sideId}" style="display:none;margin-top:0.6rem;max-height:180px;
+                overflow-y:auto;background:var(--bg-tertiary);border:1px solid var(--border);border-radius:6px"></div>
+        </div>`;
+    }
+
+    function injectUI() {
         const tabBar = document.querySelector('.upload-tabs');
-        if (!tabBar || tabBar.querySelector('[data-fc-tab]')) return;
+        if (!tabBar || tabBar.querySelector('[data-fc2-tab]')) return;
 
-        const tabBtn = document.createElement('button');
-        tabBtn.className = 'upload-tab';
-        tabBtn.dataset.fcTab = 'framework';
-        tabBtn.innerHTML = '⚖️ Framework Compliance';
-        tabBtn.addEventListener('click', () => activateFcTab());
-        tabBar.appendChild(tabBtn);
+        const btn = document.createElement('button');
+        btn.className = 'upload-tab';
+        btn.dataset.fc2Tab = '1';
+        btn.innerHTML = '🆚 FW vs Impl';
+        btn.addEventListener('click', activateTab);
+        tabBar.appendChild(btn);
 
-        /* ── Tab panel ── */
-        const uploadContent = document.querySelector('.upload-content');
-        if (!uploadContent) return;
+        const content = document.querySelector('.upload-content');
+        if (!content) return;
 
         const panel = document.createElement('div');
         panel.className = 'tab-panel';
-        panel.id = 'fc-panel';
+        panel.id = 'fc2-panel';
         panel.style.display = 'none';
         panel.innerHTML = `
             <div style="margin-bottom:1rem">
-                <div style="font-size:0.9rem;color:var(--text-secondary);margin-bottom:1rem">
-                    Paste your <strong style="color:var(--accent-purple)">framework / standard code</strong>
-                    on the left and your <strong style="color:var(--accent-blue)">implementation code</strong>
-                    on the right. The tool will score how well the implementation follows the framework.
+                <div style="font-size:0.82rem;color:var(--text-secondary);margin-bottom:1.25rem;
+                            background:var(--bg-tertiary);border:1px solid var(--border);border-radius:8px;padding:0.875rem">
+                    Upload your <strong style="color:#bc8cff">framework / standard project</strong> on the left
+                    and your <strong style="color:#58a6ff">implementation project</strong> on the right.
+                    Both sides support <strong>.java/.kt files</strong> and full project archives
+                    (<strong>.zip · .jar · .war · .ear</strong>).
+                    The tool extracts all source files and scores how well the implementation follows the framework.
                 </div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem">
-                    <!-- Framework pane -->
-                    <div>
-                        <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.5rem;flex-wrap:wrap">
-                            <label style="font-size:0.82rem;font-weight:600;color:var(--accent-purple)">
-                                📐 Framework / Standard Code
-                            </label>
-                            <input id="fc-fw-name" class="paste-input" placeholder="e.g. BaseService.java"
-                                style="flex:1;min-width:140px;font-size:0.8rem">
-                        </div>
-                        <textarea id="fc-fw-code" class="code-textarea" rows="18"
-                            placeholder="Paste your framework, base class, interface, or coding standard here...
 
-Example:
-@Service
-public abstract class BaseService&lt;T&gt; {
-    protected final Logger log = LoggerFactory.getLogger(getClass());
-
-    @Transactional
-    public abstract T create(T entity);
-
-    public abstract Optional&lt;T&gt; findById(Long id);
-}"></textarea>
-                    </div>
-                    <!-- Implementation pane -->
-                    <div>
-                        <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.5rem;flex-wrap:wrap">
-                            <label style="font-size:0.82rem;font-weight:600;color:var(--accent-blue)">
-                                🔧 Implementation Code
-                            </label>
-                            <input id="fc-impl-name" class="paste-input" placeholder="e.g. UserServiceImpl.java"
-                                style="flex:1;min-width:140px;font-size:0.8rem">
-                        </div>
-                        <textarea id="fc-impl-code" class="code-textarea" rows="18"
-                            placeholder="Paste your implementation code here...
-
-Example:
-public class UserService {
-    @Autowired
-    private UserRepository repo;
-
-    public User create(User user) {
-        return repo.save(user);
-    }
-}"></textarea>
-                    </div>
+                <!-- Two upload zones side by side -->
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.25rem;margin-bottom:1.25rem">
+                    ${buildUploadZone('fw',   '📐 Framework / Standard', '#bc8cff', '📐')}
+                    ${buildUploadZone('impl', '🔧 Implementation',       '#58a6ff', '🔧')}
                 </div>
-                <div style="display:flex;gap:0.75rem;margin-top:1rem;align-items:center;flex-wrap:wrap">
-                    <button id="fc-analyse-btn" class="btn btn-primary" onclick="window._fcRunAnalysis()">
-                        ⚖️ Analyse Compliance
-                    </button>
-                    <button class="btn" onclick="window._fcLoadSample()">
-                        🧪 Load Bad Sample
-                    </button>
-                    <button class="btn btn-sm" onclick="document.getElementById('fc-fw-code').value='';
-                        document.getElementById('fc-impl-code').value='';
-                        document.getElementById('fc-results-section').style.display='none'">
-                        🗑 Clear
-                    </button>
-                    <span id="fc-status" style="font-size:0.8rem;color:var(--text-muted)"></span>
-                </div>
-            </div>
 
-            <!-- Results -->
-            <div id="fc-results-section" style="display:none;margin-top:1.5rem;
-                background:var(--bg-secondary);border:1px solid var(--border);
-                border-radius:12px;overflow:hidden">
+                <!-- Name labels + actions -->
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:1.25rem;margin-bottom:1rem">
+                    <input id="fc2-fw-label"   class="paste-input" placeholder="Framework label e.g. company-standards-v2.zip"   style="font-size:0.82rem">
+                    <input id="fc2-impl-label" class="paste-input" placeholder="Implementation label e.g. user-service-1.0.war" style="font-size:0.82rem">
+                </div>
+
+                <div style="display:flex;gap:0.75rem;align-items:center;flex-wrap:wrap">
+                    <button class="btn btn-primary" onclick="window._fc2Analyse()">⚖️ Analyse Compliance</button>
+                    <button class="btn btn-sm" onclick="window._fc2Sample()">🧪 Load Sample Projects</button>
+                    <span id="fc2-status" style="font-size:0.8rem;color:var(--text-muted)"></span>
+                </div>
+            </div>`;
+        content.appendChild(panel);
+
+        /* Results section injected after upload section */
+        const resultSec = document.createElement('div');
+        resultSec.id = 'fc2-results-section';
+        resultSec.style.display = 'none';
+        resultSec.style.marginTop = '2rem';
+        resultSec.innerHTML = `
+            <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:12px;overflow:hidden">
                 <div style="background:var(--bg-tertiary);padding:1rem 1.5rem;border-bottom:1px solid var(--border);
-                            display:flex;justify-content:space-between;align-items:center">
-                    <div style="font-weight:700;font-size:1rem;background:linear-gradient(135deg,#58a6ff,#bc8cff);
-                                -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-                                background-clip:text">⚖️ Compliance Report</div>
-                    <button class="btn btn-sm" onclick="window._fcExport()">📄 Export</button>
+                            font-weight:700;font-size:1rem;background:linear-gradient(135deg,#bc8cff,#58a6ff);
+                            -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text">
+                    ⚖️ Framework vs Implementation — Compliance Report
                 </div>
-                <div id="fc-results" style="padding:1.5rem;max-height:70vh;overflow-y:auto"></div>
-            </div>
-        `;
-        uploadContent.appendChild(panel);
+                <div id="fc2-results" style="padding:1.5rem;max-height:80vh;overflow-y:auto"></div>
+            </div>`;
+        const uploadSec = document.querySelector('.upload-section');
+        if (uploadSec) uploadSec.insertAdjacentElement('afterend', resultSec);
+        else document.querySelector('.container').appendChild(resultSec);
     }
 
-    /* ── Activate tab ── */
-    function activateFcTab() {
+    function activateTab() {
         document.querySelectorAll('.upload-tab').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('.tab-panel').forEach(p => {
-            p.classList.remove('active');
-            p.style.display = 'none';
-        });
-        const btn = document.querySelector('[data-fc-tab]');
-        const panel = document.getElementById('fc-panel');
-        if (btn) btn.classList.add('active');
-        if (panel) { panel.classList.add('active'); panel.style.display = 'block'; }
+        document.querySelectorAll('.tab-panel').forEach(p => { p.classList.remove('active'); p.style.display = 'none'; });
+        const b = document.querySelector('[data-fc2-tab]');
+        const p = document.getElementById('fc2-panel');
+        if (b) b.classList.add('active');
+        if (p) { p.classList.add('active'); p.style.display = 'block'; }
     }
 
     /* =========================================================
-       5. GLOBAL ANALYSIS TRIGGER
+       SECTION E — GLOBAL HANDLERS
        ========================================================= */
 
-    window._fcRunAnalysis = function () {
-        const fwCode   = (document.getElementById('fc-fw-code')   || {}).value || '';
-        const implCode = (document.getElementById('fc-impl-code') || {}).value || '';
-        const fwName   = (document.getElementById('fc-fw-name')   || {}).value || 'Framework';
-        const implName = (document.getElementById('fc-impl-name') || {}).value || 'Implementation';
-        const status   = document.getElementById('fc-status');
-        const section  = document.getElementById('fc-results-section');
+    window._fc2Files   = (side, files) => readSourceFiles(files, side);
+    window._fc2Archive = (side, file)  => { if (file) extractArchive(file, side); };
+    window._fc2Clear   = (side)        => clearSide(side);
+    window._fc2Remove  = (side, idx)   => removeFile(side, idx);
 
-        if (!fwCode.trim() || !implCode.trim()) {
-            if (status) { status.textContent = '⚠️ Please paste both framework and implementation code.'; }
-            return;
-        }
-        if (status) status.textContent = 'Analysing…';
-
-        setTimeout(() => {
-            const report = analyzeCompliance(fwCode, implCode);
-            renderComplianceReport(report, fwName, implName);
-            if (section) section.style.display = '';
-            if (status) status.textContent = `Done — ${report.percentage}% compliant (${report.violations.length} violations)`;
-            section.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }, 50);
+    window._fc2Drop = function (side, e) {
+        Array.from(e.dataTransfer.files).forEach(f => {
+            if (/\.(zip|jar|war|ear)$/i.test(f.name)) extractArchive(f, side);
+            else if (/\.(java|kt|groovy)$/i.test(f.name)) readSourceFiles([f], side);
+        });
     };
 
-    /* =========================================================
-       6. LOAD BAD SAMPLE (framework vs broken impl)
-       ========================================================= */
+    window._fc2AddPaste = function (side) {
+        const code = (document.getElementById(`fc2-paste-${side}`) || {}).value || '';
+        const name = (document.getElementById(`fc2-paste-name-${side}`) || {}).value || `pasted-${Date.now()}.java`;
+        if (!code.trim()) return;
+        addFiles(side, [{ filename: name, code }]);
+        const ta = document.getElementById(`fc2-paste-${side}`);
+        if (ta) ta.value = '';
+    };
 
-    const SAMPLE_FRAMEWORK = `import org.slf4j.Logger;
+    window._fc2Analyse = function () {
+        if (store.fw.length === 0)   { setStatus('⚠️ Upload or paste framework code first.'); return; }
+        if (store.impl.length === 0) { setStatus('⚠️ Upload or paste implementation code first.'); return; }
+        setStatus(`Analysing ${store.fw.length} framework file(s) vs ${store.impl.length} implementation file(s)…`);
+
+        setTimeout(() => {
+            const fwCode   = mergeCode('fw');
+            const implCode = mergeCode('impl');
+            const fwLabel   = (document.getElementById('fc2-fw-label')   || {}).value || `${store.fw.length} framework file(s)`;
+            const implLabel = (document.getElementById('fc2-impl-label') || {}).value || `${store.impl.length} implementation file(s)`;
+            const report = analyzeCompliance(fwCode, implCode, fwLabel, implLabel);
+            window._fc2LastReport = report;
+            renderReport(report);
+            const sec = document.getElementById('fc2-results-section');
+            if (sec) { sec.style.display = ''; sec.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+            setStatus(`Done — ${report.percentage}% compliant · ${report.violations.length} violation(s) found`);
+        }, 60);
+    };
+
+    /* ─── Sample projects ─── */
+    window._fc2Sample = function () {
+        clearSide('fw');
+        clearSide('impl');
+
+        addFiles('fw', [
+            { filename: 'BaseService.java', code: `import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.transaction.annotation.Transactional;
 import java.util.Optional;
 
-/**
- * FRAMEWORK STANDARD: All services must extend this base class.
- * - Constructor injection only (no @Autowired fields)
- * - @Transactional on all write methods
- * - SLF4J logging via log field
- * - Custom exceptions (never plain RuntimeException)
- * - Returns Optional<T> for nullable finds
- * - ResponseEntity for all controller returns
- */
+/** FRAMEWORK STANDARD: All services MUST extend this class */
 public abstract class BaseService<T, ID> {
-
     protected final Logger log = LoggerFactory.getLogger(getClass());
 
     @Transactional
@@ -777,115 +653,180 @@ public abstract class BaseService<T, ID> {
 
     public abstract Optional<T> findById(ID id);
 
-    protected void validateNotNull(Object value, String fieldName) {
-        if (value == null) throw new ValidationException(fieldName + " must not be null");
+    protected void requireNonNull(Object val, String name) {
+        if (val == null) throw new ValidationException(name + " must not be null");
     }
-}`;
+}` },
+            { filename: 'BaseController.java', code: `import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import javax.validation.Valid;
 
-    const SAMPLE_IMPL = `import org.springframework.beans.factory.annotation.Autowired;
+/** FRAMEWORK STANDARD: All controllers MUST extend this class */
+public abstract class BaseController<T, ID> {
+    @PostMapping
+    public abstract ResponseEntity<T> create(@Valid @RequestBody T dto);
+
+    @GetMapping("/{id}")
+    public abstract ResponseEntity<T> get(@PathVariable ID id);
+
+    @DeleteMapping("/{id}")
+    public abstract ResponseEntity<Void> delete(@PathVariable ID id);
+}` },
+            { filename: 'company-standards.java', code: `// COMPANY CODING STANDARDS
+// 1. All services must use constructor injection (no @Autowired fields)
+// 2. All controllers return ResponseEntity<Dto> — never return @Entity
+// 3. All repositories must be interfaces extending JpaRepository
+// 4. Always log with SLF4J (@Slf4j from Lombok preferred)
+// 5. Custom exceptions: never throw plain RuntimeException
+// 6. Use Optional<T> for nullable returns from service methods
+// Required imports:
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.http.ResponseEntity;
+import java.util.Optional;` }
+        ]);
 
-// BAD: Many violations against the framework standard above
-// Missing @Service is marked but present. Field injection used.
-// No extends BaseService. No SLF4J logger. No @Transactional.
-// Returns null instead of Optional. Swallows exceptions.
+        addFiles('impl', [
+            { filename: 'UserService.java', code: `// BAD IMPLEMENTATION — violates framework standards
+import org.springframework.beans.factory.annotation.Autowired;
+import javax.persistence.EntityManager;
 
-@Service
+// Missing @Service annotation
+// Missing extends BaseService
 public class UserService {
-
-    // VIOLATION: field injection instead of constructor injection
-    @Autowired
+    @Autowired  // VIOLATION: field injection instead of constructor
     private UserRepository userRepository;
 
-    // VIOLATION: no @Transactional on write method
-    // VIOLATION: returns raw User not declared in base contract
+    @Autowired
+    private EntityManager em;  // VIOLATION: direct EM in service
+
+    // VIOLATION: no @Transactional, returns null instead of Optional
     public User create(User user) {
-        if (user == null) return null;      // returns null instead of Optional
-        return userRepository.save(user);
-    }
-
-    // VIOLATION: no @Transactional
-    // VIOLATION: no logging
-    public User update(Long id, User updated) {
-        User existing = userRepository.findById(id).orElse(null);
-        if (existing == null) {
-            throw new RuntimeException("Not found"); // VIOLATION: plain RuntimeException
-        }
-        existing.setName(updated.getName());
-        return userRepository.save(existing);
-    }
-
-    // VIOLATION: no @Transactional
-    // VIOLATION: swallowing exception silently
-    public void delete(Long id) {
         try {
-            userRepository.deleteById(id);
+            return userRepository.save(user);
         } catch (Exception e) {
-            // silent swallow — no log, no rethrow
+            // VIOLATION: swallowing exception silently
         }
+        return null;
     }
 
-    // VIOLATION: returns null instead of Optional<User>
-    public User findById(Long id) {
-        return userRepository.findById(id).orElse(null);
+    // VIOLATION: no @Transactional on write method
+    public User update(Long id, User updated) {
+        User u = userRepository.findById(id).orElse(null);
+        if (u == null) throw new RuntimeException("Not found"); // VIOLATION: plain RuntimeException
+        u.setName(updated.getName());
+        return userRepository.save(u);
     }
-}`;
+}` },
+            { filename: 'UserController.java', code: `// BAD IMPLEMENTATION — violates framework standards
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.*;
+import java.util.List;
 
-    window._fcLoadSample = function () {
-        const fw   = document.getElementById('fc-fw-code');
-        const impl = document.getElementById('fc-impl-code');
-        const fn   = document.getElementById('fc-fw-name');
-        const in_  = document.getElementById('fc-impl-name');
-        if (fw)   fw.value   = SAMPLE_FRAMEWORK;
-        if (impl) impl.value = SAMPLE_IMPL;
-        if (fn)   fn.value   = 'BaseService.java';
-        if (in_)  in_.value  = 'UserService.java (bad impl)';
-        const status = document.getElementById('fc-status');
-        if (status) status.textContent = 'Sample loaded — click Analyse Compliance.';
+// Missing extends BaseController
+@RestController @RequestMapping("/users")
+public class UserController {
+
+    @Autowired  // VIOLATION: field injection
+    private UserRepository userRepository;  // VIOLATION: repo in controller
+
+    // VIOLATION: no @Valid, returns @Entity not Dto, business logic in controller
+    @PostMapping
+    public User createUser(@RequestBody User user) {
+        if (user.getName() == null) throw new RuntimeException("bad");
+        return userRepository.save(user);  // returns @Entity
+    }
+
+    // VIOLATION: business logic in controller
+    @GetMapping("/active")
+    public List<User> getActive() {
+        return userRepository.findAll().stream()
+            .filter(User::isActive)
+            .collect(java.util.stream.Collectors.toList());
+    }
+}` },
+            { filename: 'UserRepository.java', code: `// BAD REPOSITORY — violates framework standards
+import org.springframework.stereotype.Repository;
+import javax.persistence.EntityManager;
+import org.springframework.transaction.annotation.Transactional;
+
+// VIOLATION: class not interface, business logic in repo
+@Repository
+public class UserRepository {
+    private EntityManager em;
+
+    public User findAndValidate(Long id) {
+        User u = em.find(User.class, id);
+        if (u == null) throw new RuntimeException("not found"); // business logic!
+        if (!u.isActive()) throw new RuntimeException("inactive");
+        return u;
+    }
+
+    @Transactional  // VIOLATION: transaction in repo
+    public void batchUpdate(java.util.List<Long> ids) {
+        ids.forEach(id -> em.find(User.class, id));
+    }
+}` }
+        ]);
+
+        document.getElementById('fc2-fw-label').value   = 'company-framework-standards';
+        document.getElementById('fc2-impl-label').value = 'user-service-impl (bad)';
+        setStatus('Sample projects loaded (3 framework files vs 3 bad implementation files). Click Analyse.');
     };
 
-    /* =========================================================
-       7. EXPORT
-       ========================================================= */
-
-    window._fcExport = function () {
-        const el = document.getElementById('fc-results');
-        if (!el || !el.innerHTML) return;
-        const blob = new Blob([
-            `<!DOCTYPE html><html><head><meta charset="UTF-8">
-             <title>Compliance Report</title>
-             <style>body{font-family:Arial,sans-serif;background:#0d1117;color:#c9d1d9;padding:2rem}
-             </style></head><body>${el.innerHTML}</body></html>`
+    window._fc2Export = function () {
+        const el = document.getElementById('fc2-results');
+        if (!el || !el.innerHTML.trim()) { setStatus('Nothing to export yet.'); return; }
+        const r = window._fc2LastReport || {};
+        const blob = new Blob([`<!DOCTYPE html><html><head><meta charset="UTF-8">
+            <title>Framework Compliance Report</title>
+            <style>body{font-family:Arial,sans-serif;background:#0d1117;color:#c9d1d9;padding:2rem;max-width:1100px;margin:0 auto}
+            h1{color:#bc8cff}</style></head><body>
+            <h1>⚖️ Framework vs Implementation Compliance Report</h1>
+            <p>Framework: ${r.fwLabel || ''} (${r.fwFiles || 0} files) &nbsp;|&nbsp;
+               Implementation: ${r.implLabel || ''} (${r.implFiles || 0} files)</p>
+            <p>Generated: ${new Date().toLocaleString()}</p>
+            ${el.innerHTML}</body></html>`
         ], { type: 'text/html' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = `compliance-report-${Date.now()}.html`;
+        a.download = `fw-compliance-${Date.now()}.html`;
         a.click();
     };
 
+    function setStatus(msg) {
+        const el = document.getElementById('fc2-status');
+        if (el) el.textContent = msg;
+    }
+
     /* =========================================================
-       8. INIT
+       SECTION F — RESPONSIVE CSS + INIT
        ========================================================= */
 
-    function init() {
-        injectFrameworkTab();
-        // Responsive tweak: stack panels on narrow screens
-        const style = document.createElement('style');
-        style.textContent = `
-            @media(max-width:800px){
-                #fc-panel [style*="grid-template-columns:1fr 1fr"]{
-                    grid-template-columns:1fr !important;
+    function injectCSS() {
+        const s = document.createElement('style');
+        s.textContent = `
+            #fc2-panel { display: none; }
+            #fc2-panel.active { display: block; }
+            #fc2-results-section { display: none; }
+            @media (max-width: 800px) {
+                #fc2-panel [style*="grid-template-columns:1fr 1fr"] {
+                    grid-template-columns: 1fr !important;
                 }
-            }
-        `;
-        document.head.appendChild(style);
-        console.info('[Framework Compliance] ✅ Loaded — Framework vs Implementation checker active.');
+            }`;
+        document.head.appendChild(s);
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', init);
-    } else {
-        init();
+    function init() {
+        injectCSS();
+        injectUI();
+        console.info('[FW vs Impl Compliance] ✅ Loaded — project ZIP/JAR/WAR upload supported on both sides.');
     }
+
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+    else init();
 
 })();
